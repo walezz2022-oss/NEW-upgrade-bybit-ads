@@ -1,0 +1,9 @@
+python-telegram-bot==21.9
+httpx>=0.27.0
+requests
+flask
+python-dotenv
+paga-business-client
+openpyxl
+yt-dlp
+imageio-ffmpeg
