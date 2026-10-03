@@ -64,7 +64,12 @@ BB_WARMUP_POLL_SECONDS  = 2
 # ─────────────────────────────────────────
 # 🖼️ Welcome banner image
 # ─────────────────────────────────────────
-BANNER_URL = "https://raw.githubusercontent.com/akinrinadeakinniyi401-dot/bybit-p2p-telegram-bot/main/photo_6017280178934975538_x.jpg"
+# To change the banner: set BANNER_URL in Render's environment variables to any
+# direct image link (https://…jpg/png), or replace the default below.
+BANNER_URL = os.getenv(
+    "BANNER_URL",
+    "https://raw.githubusercontent.com/akinrinadeakinniyi401-dot/bybit-p2p-telegram-bot/main/photo_6017280178934975538_x.jpg",
+)
 
 
 async def _get_current_ip() -> str:
@@ -336,7 +341,7 @@ def _required_fresh_move(sess, slot_idx: int, currency: str, token: str, referen
     instead of one flat number shared by every slot:
       - Senior-most ad (nothing to defer to, e.g. Ad 1): no extra
         requirement beyond the normal fast-chase reaction gap
-        (fallback_gap, $0.50/₦1,500) — it can react to any real move.
+        (fallback_gap, ~1 cent for USD pairs / ₦1,500) — it can react to any real move.
       - One ad below it (e.g. Ad 2): needs its own real spacing to have
         opened up — $9/₦12,600 — before a re-probe can possibly produce
         a genuinely different final price.
@@ -1093,8 +1098,10 @@ def _fast_chase_lock(sess, slot_idx: int) -> asyncio.Lock:
 _FAST_CHASE_GAP_OVERRIDE = {
     ("NGN", "BTC"): Decimal("1500"),
     ("NGN", "ETH"): Decimal("1500"),
-    ("USD", "BTC"): Decimal("0.5"),
-    ("USD", "ETH"): Decimal("0.5"),
+    # USD pairs: NO reaction threshold. 0.005 is just "any real move" — the
+    # posted price is rounded to 0.01 anyway, so even a 1-cent rise is picked up.
+    ("USD", "BTC"): Decimal("0.005"),
+    ("USD", "ETH"): Decimal("0.005"),
 }
 
 # Ad 1 (BTC/USD) — NO reaction threshold at all: any upward move in the
