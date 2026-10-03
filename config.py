@@ -1,0 +1,102 @@
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
+# ── Render persistent disk mount path ──
+# Set DISK_PATH in Render environment to match your disk mount point (default /data)
+DISK_PATH = os.getenv("DISK_PATH", "/data")
+
+# ── Multiple Bybit accounts (admin/env fallback) ──
+# Set BYBIT_API_KEY_1, BYBIT_API_SECRET_1, BYBIT_ACCOUNT_LABEL_1 etc. in Render
+BYBIT_ACCOUNTS = []
+for i in range(1, 10):
+    key    = os.getenv(f"BYBIT_API_KEY_{i}")
+    secret = os.getenv(f"BYBIT_API_SECRET_{i}")
+    if key and secret:
+        BYBIT_ACCOUNTS.append({
+            "label":  os.getenv(f"BYBIT_ACCOUNT_LABEL_{i}", f"Account {i}"),
+            "key":    key.strip(),
+            "secret": secret.strip(),
+        })
+
+# Fallback: legacy single key
+if not BYBIT_ACCOUNTS:
+    key    = os.getenv("BYBIT_API_KEY")
+    secret = os.getenv("BYBIT_API_SECRET")
+    if key and secret:
+        BYBIT_ACCOUNTS.append({
+            "label":  "Account 1",
+            "key":    key.strip(),
+            "secret": secret.strip(),
+        })
+
+if not BYBIT_ACCOUNTS:
+    # Do NOT crash on startup — multi-user bot loads Bybit credentials dynamically
+    # from DB per user/slot. Env keys are optional (admin convenience only).
+    # If no env keys are set, admin-mode API calls will fail gracefully with an error
+    # rather than crashing the entire bot at startup.
+    import logging as _logging
+    _logging.getLogger(__name__).warning(
+        "No Bybit API keys found in environment. "
+        "This is fine for multi-user mode — users supply their own keys via bot setup. "
+        "Set BYBIT_API_KEY_1 / BYBIT_API_SECRET_1 in Render only if you need admin-mode Bybit access."
+    )
+
+# ── Multiple admin Telegram IDs ──
+# Set ADMIN_ID_1, ADMIN_ID_2 etc. in Render
+ADMIN_IDS = set()
+# Every ID listed here receives admin notifications (upgrade requests, etc.)
+# and gets the admin commands. Supported formats (all can be combined):
+#   ADMIN_ID_1, ADMIN_ID_2, ... ADMIN_ID_50   — one ID per variable
+#   ADMIN_IDS="111,222,333"                   — comma/space separated list
+#   ADMIN_TELEGRAM_ID                         — legacy single ID
+def _add_admin_id(raw):
+    try:
+        ADMIN_IDS.add(int(str(raw).strip()))
+    except ValueError:
+        pass
+
+for i in range(1, 51):
+    val = os.getenv(f"ADMIN_ID_{i}")
+    if val:
+        _add_admin_id(val)
+
+for _part in os.getenv("ADMIN_IDS", "").replace(";", ",").replace(" ", ",").split(","):
+    if _part.strip():
+        _add_admin_id(_part)
+
+val = os.getenv("ADMIN_TELEGRAM_ID")
+if val:
+    _add_admin_id(val)
+
+if not ADMIN_IDS:
+    raise ValueError("No admin IDs set. Add ADMIN_ID_1 to Render environment variables.")
+
+# ── Flutterwave credentials (optional) ──
+FLW_CLIENT_ID     = os.getenv("FLW_CLIENT_ID", "")
+FLW_CLIENT_SECRET = os.getenv("FLW_CLIENT_SECRET", "")
+FLW_SECRET_HASH   = os.getenv("FLW_SECRET_HASH", "")
+FLW_SECRET_KEY    = os.getenv("FLW_SECRET_KEY", "")   # Standard v3 API secret key
+
+# ── Paga credentials (optional) ──
+# Set these in your Render environment:
+#
+#   PAGA_PRINCIPAL   → Your Paga Business Public Key / Principal
+#                      (labelled "Public Key" or "Principal" on Paga dashboard)
+#
+#   PAGA_CREDENTIAL  → Your Paga Business Live Primary Secret Key / Credential
+#                      (labelled "Live Primary Secret Key" or "Credential" on Paga dashboard)
+#                      ⚠️  This is NOT the Hash Key — do not confuse them
+#
+#   PAGA_API_KEY     → Your Paga HMAC Hash Key
+#                      (labelled "Hash Key" or "API Key" on Paga dashboard)
+#                      Used by the library for request signing — separate from auth
+#
+# The paga-business-client library maps them as:
+#   BusinessClientCore(principal=PAGA_PRINCIPAL, credential=PAGA_CREDENTIAL, api_key=PAGA_API_KEY)
+#
+PAGA_PRINCIPAL  = os.getenv("PAGA_PRINCIPAL",  "")
+PAGA_CREDENTIAL = os.getenv("PAGA_CREDENTIAL", "")
+PAGA_API_KEY    = os.getenv("PAGA_API_KEY",    "")
