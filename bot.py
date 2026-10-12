@@ -72,14 +72,22 @@ BANNER_URL = os.getenv(
 )
 
 
-async def _get_current_ip() -> str:
+def _get_current_ip_sync() -> str:
     import requests as _r
-    for svc in ["https://api.ipify.org", "https://ifconfig.me/ip"]:
+    for svc in ["https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"]:
         try:
-            return _r.get(svc, timeout=4).text.strip()
+            ip = _r.get(svc, timeout=4).text.strip()
+            if ip:
+                return ip
         except Exception:
             continue
     return "unknown"
+
+
+async def _get_current_ip() -> str:
+    # Run the blocking HTTP lookup in a thread so it never freezes the bot's
+    # event loop (which would stall every user's buttons and ad loops).
+    return await asyncio.get_event_loop().run_in_executor(None, _get_current_ip_sync)
 
 
 # ─────────────────────────────────────────
@@ -1573,6 +1581,25 @@ def _is_flood_controlled(chat_id) -> bool:
     return until is not None and datetime.now() < until
 
 
+# Hard ceiling on bot→chat messages per rolling minute. Telegram's own
+# guidance is ~1 msg/sec per private chat; with 8 ads running, per-ad
+# throttles alone could still add up, so this caps the TOTAL per chat.
+# Excess notices are dropped (the ads themselves keep working).
+_CHAT_MAX_MSGS_PER_MIN = int(os.getenv("TG_MAX_MSGS_PER_MIN", "15") or 15)
+_chat_send_log: dict = {}
+
+def _chat_send_allowed(chat_id) -> bool:
+    import time as _t
+    now = _t.monotonic()
+    dq = _chat_send_log.setdefault(chat_id, [])
+    while dq and now - dq[0] > 60:
+        dq.pop(0)
+    if len(dq) >= _CHAT_MAX_MSGS_PER_MIN:
+        return False
+    dq.append(now)
+    return True
+
+
 async def _safe_send(bot, **kwargs) -> bool:
     """Drop-in replacement for `bot.send_message(...)` that NEVER raises.
 
@@ -1601,6 +1628,9 @@ async def _safe_send(bot, **kwargs) -> bool:
     """
     chat_id = kwargs.get("chat_id")
     if chat_id is not None and _is_flood_controlled(chat_id):
+        return False
+    if chat_id is not None and not _chat_send_allowed(chat_id):
+        logger.info(f"[TelegramFlood] chat={chat_id} over {_CHAT_MAX_MSGS_PER_MIN} msgs/min — message dropped to avoid a Telegram ban")
         return False
     try:
         await bot.send_message(**kwargs)
@@ -4088,18 +4118,46 @@ async def send_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def _answer_flood(query, chat_id):
+    """Tell the user (via a callback toast — not a message) that Telegram has
+    temporarily rate-limited this chat, instead of crashing or retrying."""
+    until = _flood_controlled_until.get(chat_id)
+    mins = max(1, int(((until - datetime.now()).total_seconds() + 59) // 60)) if until else 0
+    try:
+        await query.answer(
+            f"⏳ Telegram has temporarily rate-limited this chat"
+            + (f" (about {mins} min left)" if mins else "")
+            + ". Your ads and Auto-Pay keep running; menus will work again shortly.",
+            show_alert=True,
+        )
+    except Exception:
+        pass
+
+
 async def edit_menu(query, text: str, keyboard: InlineKeyboardMarkup):
     """Edit the existing menu message (photo caption or plain text).
     Tries caption first (photo messages), falls back to text, then sends new message."""
     # Try caption edit (for photo/banner messages)
+    chat_id = query.message.chat_id if query and query.message else None
+    if chat_id is not None and _is_flood_controlled(chat_id):
+        await _answer_flood(query, chat_id)
+        return
     try:
         await query.edit_message_caption(caption=text, reply_markup=keyboard, parse_mode="HTML")
+        return
+    except RetryAfter as e:
+        _mark_flood_controlled(chat_id, e.retry_after)
+        await _answer_flood(query, chat_id)
         return
     except Exception:
         pass
     # Try text edit (for plain text messages)
     try:
         await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="HTML")
+        return
+    except RetryAfter as e:
+        _mark_flood_controlled(chat_id, e.retry_after)
+        await _answer_flood(query, chat_id)
         return
     except Exception as e:
         logger.warning(f"[edit_menu] edit failed: {e}")
@@ -4263,8 +4321,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Main callback button handler. Wrapped with full exception logging so
     any crash is visible in Render logs with exact line + traceback.
     """
+    _q0 = getattr(update, "callback_query", None)
+    _cid0 = _q0.message.chat_id if (_q0 and _q0.message) else None
+    if _cid0 is not None and _is_flood_controlled(_cid0):
+        await _answer_flood(_q0, _cid0)
+        return
     try:
         await _button_handler_inner(update, context)
+    except RetryAfter as _ra:
+        if _cid0 is not None:
+            _mark_flood_controlled(_cid0, _ra.retry_after)
+        logger.warning(f"[ButtonHandler] Telegram flood control for chat {_cid0}: retry in {_ra.retry_after}s")
+        if _q0:
+            await _answer_flood(_q0, _cid0)
     except Exception as _bh_err:
         import traceback
         logger.error(
@@ -4360,27 +4429,16 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     # ── 🌍 Get My IP ──
     elif data == "get_my_ip":
-        await query.edit_message_caption(caption="⏳ Fetching public IP...", parse_mode="HTML") \
-            if query.message.photo else await query.edit_message_text("⏳ Fetching public IP...")
-        import requests as _req
-        ip = None
-        for svc in ["https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"]:
-            try:
-                ip = _req.get(svc, timeout=5).text.strip()
-                if ip: break
-            except Exception:
-                continue
-        txt = (
-            f"🌍 <b>Public IP Address</b>\n\n<code>{ip}</code>\n\n"
-            "👉 Add this to your Bybit API whitelist if it changed."
-        ) if ip else "❌ Could not fetch IP. Try again."
-
-        kb_rows = list(back_main())
-
-        try:
-            await query.edit_message_caption(caption=txt, reply_markup=InlineKeyboardMarkup(kb_rows), parse_mode="HTML")
-        except Exception:
-            await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb_rows), parse_mode="HTML")
+        await query.answer("⏳ Fetching public IP...")
+        ip = await _get_current_ip()
+        if ip and ip != "unknown":
+            txt = (
+                f"🌍 <b>Public IP Address</b>\n\n<code>{ip}</code>\n\n"
+                "👉 Add this to your Bybit API whitelist if it changed."
+            )
+        else:
+            txt = "❌ Could not fetch IP. Try again."
+        await edit_menu(query, txt, InlineKeyboardMarkup(list(back_main())))
 
     # ── 🔑 Switch Account ──
     elif data.startswith("switch_account_"):
