@@ -198,6 +198,8 @@ MAX_ADS_PER_USER = 8
 #   2. USDT/USD barely moves compared to BTC, so those price changes are
 #      rare — polling often mostly confirms "nothing changed, skip".
 MIN_USDT_INTERVAL_SECONDS = 5
+# USDT/USD in Quick Market mode only (snapshot read, no Bybit call per cycle).
+MIN_USDT_QUICK_INTERVAL_SECONDS = 1
 
 # BTC/NGN in AD COPY mode only. Same reasoning as USDT/USD above — it's a
 # copy mode, so a fast cycle is mostly reads and it only submits an edit
