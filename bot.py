@@ -718,13 +718,18 @@ def _is_usdt_usd_ad(ad_data: dict) -> bool:
 def _interval_floor_secs(s: dict, ad_data: dict):
     """The seconds-level interval floor for this ad, or None if this ad
     uses the normal whole-minutes floor instead.
-      • USDT/USD               → 5s
+      • USDT/USD               → 1s in Quick Market, 5s in other modes
       • BTC/NGN in ad_copy mode → 10s
     Floating/fixed BTC/NGN ads are NOT included — they keep the 2-minute
     floor, since they submit an edit every cycle rather than only on a
     genuine price change.
     """
     if _is_usdt_usd_ad(ad_data):
+        # Quick Market only reads an in-memory snapshot each cycle (no Bybit
+        # call) and edits only when the price changes, so 1s is safe there.
+        # Every other USDT/USD mode keeps the 5s floor.
+        if s.get("mode") == "decodo_market":
+            return bybit.MIN_USDT_QUICK_INTERVAL_SECONDS
         return bybit.MIN_USDT_INTERVAL_SECONDS
     if _is_btc_ngn_ad(ad_data) and s.get("mode") in ("ad_copy", "browserbase_market", "decodo_market"):
         return bybit.MIN_BTC_NGN_ADCOPY_INTERVAL_SECONDS
@@ -1689,28 +1694,28 @@ def _should_notify_now(s: dict, key: str, cooldown_secs: int = None) -> bool:
 
 
 # Successful-edit notices ("✅ Cycle N 💲 price", "⚡ Fast update") are the
-# highest-volume Telegram messages the bot sends. Quick Market polls every
-# 5s and USDT/USD ads can run at similar fine intervals, so a market that
-# keeps moving would otherwise produce up to 12 messages/minute per ad —
-# the same pattern that got a chat flood-locked for over an hour in
-# production. Cap them to one per AD_EDIT_SUCCESS_NOTIFY_SECONDS per ad
-# slot. Ads whose own interval is already >= that cap are NOT affected
-# (they naturally send at most one per cycle, exactly as before). The edit
-# itself is never skipped — only the Telegram message — and the next
-# message that does go out says how many edits it is summarising.
-_EDIT_NOTIFY_SECONDS = int(os.getenv("AD_EDIT_SUCCESS_NOTIFY_SECONDS", "60") or 60)
+# highest-volume Telegram messages the bot sends, and they are what got chats
+# flood-banned. Rule, per ad slot: the FIRST few notices after the ad is
+# started go out (so the user can see it is working), then at most ONE every
+# 30 minutes. The edit itself is never skipped — only the Telegram message —
+# and the next message that does go out says how many edits it covers.
+# Errors/warnings are NOT affected by this; they have their own paths.
+_EDIT_NOTIFY_INITIAL = 3        # notices always sent right after an ad starts
+_EDIT_NOTIFY_SECONDS = 1800     # afterwards: at most one per 30 minutes per ad
 
 def _edit_notice(s: dict, interval_secs: int):
     """Decide whether a successful-edit notice should be sent now.
     Returns (send, suppressed): `suppressed` is how many edit notices were
     held back since the last one that was sent (0 if none)."""
     count_key = "_notify_count_edit_ok"
-    try:
-        interval_secs = int(interval_secs)
-    except (TypeError, ValueError):
-        interval_secs = _EDIT_NOTIFY_SECONDS
-    if interval_secs >= _EDIT_NOTIFY_SECONDS:
-        return True, 0                       # slow ad — one per cycle, as always
+    sent_key  = "_notify_sent_edit_ok"
+    sent = int(s.get(sent_key, 0) or 0)
+    if sent < _EDIT_NOTIFY_INITIAL:
+        s[sent_key] = sent + 1
+        _should_notify_now(s, "edit_ok", 0)          # stamp the time of this one
+        held = int(s.get(count_key, 0) or 0)
+        s[count_key] = 0
+        return True, held
     if _should_notify_now(s, "edit_ok", _EDIT_NOTIFY_SECONDS):
         held = int(s.get(count_key, 0) or 0)
         s[count_key] = 0
@@ -1722,8 +1727,8 @@ def _edit_notice_suffix(suppressed: int) -> str:
     if not suppressed:
         return ""
     return (f"\n<i>(+{suppressed} more edit{'s' if suppressed != 1 else ''} since the last "
-            f"message — notices are limited to one per {_EDIT_NOTIFY_SECONDS}s to protect your "
-            f"Telegram account from rate limits)</i>")
+            f"message — update notices are limited to protect your Telegram "
+            f"account from rate limits; your ad is still being edited every time)</i>")
 
 
 async def _safe_reply(message, text: str, **kwargs) -> bool:
@@ -3020,6 +3025,8 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
         return
 
     cycle = 0
+    s["_notify_sent_edit_ok"]  = 0     # fresh start -> the first few "ad is working" notices go out again
+    s["_notify_count_edit_ok"] = 0
     try:
       while _ad_running(sess, slot_idx):
         try:
@@ -3490,7 +3497,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 _dm_new_p = dm_snap["latest_price"]
                 _dm_prev_price = ad_data.get("price")
                 if _dm_prev_price is not None and _price_str_equal(_dm_prev_price, _dm_new_p):
-                    logger.info(
+                    (logger.info if interval_secs >= 5 else logger.debug)(
                         f"[{label}] Quick Market ({_dm_pair_key}) price unchanged "
                         f"({_dm_new_p}) since last copy — skipping edit this cycle"
                     )
