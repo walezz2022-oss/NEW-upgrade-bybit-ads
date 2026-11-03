@@ -21,6 +21,7 @@ import hashlib
 import requests
 import json
 import logging
+import time as _time
 import uuid
 import os
 from decimal import Decimal
@@ -308,9 +309,59 @@ def _get_headers(api_key: str, api_secret: str, payload: str = "") -> dict:
     }
 
 
-def parse_response(response, label=""):
+# ─────────────────────────────────────────
+# 📊 Bybit rate-limit headers
+# ─────────────────────────────────────────
+# Every Bybit response carries (limits are per UID, per endpoint, per second):
+#   X-Bapi-Limit                 — the endpoint's limit
+#   X-Bapi-Limit-Status          — requests left in the current window
+#   X-Bapi-Limit-Reset-Timestamp — ms timestamp when the window resets
+# They are logged on every modify and whenever an endpoint is nearly/fully
+# used up, attached to the response dict as "_rate", and remembered per API
+# key so the bot can tell the user exactly which endpoint hit the limit.
+_last_rate_hit: dict = {}      # api_key -> {"endpoint","limit","remaining","reset_in","ts","code","msg"}
+
+
+def _read_rate_headers(response, endpoint: str) -> dict:
+    h = getattr(response, "headers", None) or {}
+    def _num(name):
+        v = h.get(name)
+        try:
+            return float(v) if v not in (None, "") else None
+        except (TypeError, ValueError):
+            return None
+    limit, remaining, reset_ts = _num("X-Bapi-Limit"), _num("X-Bapi-Limit-Status"), _num("X-Bapi-Limit-Reset-Timestamp")
+    reset_in = None
+    if reset_ts is not None:
+        reset_in = max(0.0, reset_ts / 1000.0 - _time.time())
+    return {
+        "endpoint": endpoint,
+        "limit": None if limit is None else int(limit),
+        "remaining": None if remaining is None else int(remaining),
+        "reset_in": reset_in,
+    }
+
+
+def _rate_str(rate: dict) -> str:
+    if not rate or rate.get("limit") is None:
+        return "RATE headers: none"
+    ri = rate.get("reset_in")
+    return (f"RATE limit={rate['limit']}/s remaining={rate['remaining']} "
+            f"reset_in={'?' if ri is None else f'{ri:.2f}s'}")
+
+
+def get_rate_hit(creds: dict | None):
+    """Most recent rate-limit rejection (10006 / HTTP 403/429) for these creds, or None."""
+    try:
+        return _last_rate_hit.get(_resolve_creds(creds)[0])
+    except Exception:
+        return None
+
+
+def parse_response(response, label="", creds=None, endpoint=""):
     status = response.status_code
     text   = response.text or ""
+    rate   = _read_rate_headers(response, endpoint or label.strip(" []"))
     if not text.strip():
         logger.debug(f"[Bybit]{label} HTTP {status} | empty response")
         return {"retCode": -1, "retMsg": "Empty response — check IP whitelist"}
@@ -326,10 +377,24 @@ def parse_response(response, label=""):
             data["retCode"] = data["ret_code"]
             data["retMsg"]  = data.get("ret_msg", "")
         ret_code = data.get("retCode", data.get("ret_code", -1))
+        data["_rate"] = rate
+        _near_limit = rate.get("remaining") is not None and rate["remaining"] <= 1
         if ret_code != 0:
-            logger.info(f"[Bybit]{label} HTTP {status} | retCode={ret_code} msg={data.get('retMsg','')!r}")
+            logger.info(f"[Bybit]{label} HTTP {status} | retCode={ret_code} msg={data.get('retMsg','')!r} | {_rate_str(rate)}")
+        elif endpoint == "update" or _near_limit:
+            # Modifies are logged on SUCCESS too, so Render's logs show the
+            # confirming retCode=0 for every edit (with the headers).
+            logger.info(f"[Bybit]{label} HTTP {status} | retCode=0 SUCCESS | {_rate_str(rate)}")
         else:
-            logger.debug(f"[Bybit]{label} HTTP {status} | SUCCESS")
+            logger.debug(f"[Bybit]{label} HTTP {status} | SUCCESS | {_rate_str(rate)}")
+        if str(ret_code) == "10006" or status in (403, 429):
+            try:
+                _last_rate_hit[_resolve_creds(creds)[0]] = {
+                    **rate, "code": ret_code, "msg": data.get("retMsg", ""), "http": status, "ts": _time.time()}
+            except Exception:
+                pass
+            logger.warning(f"[Bybit] ⚠️ RATE LIMIT HIT on endpoint '{rate.get('endpoint')}' "
+                           f"(HTTP {status}, retCode={ret_code}) | {_rate_str(rate)}")
         return data
     except Exception as e:
         logger.error(f"[Bybit]{label} JSON parse error: {e} | body={text[:200]!r}")
@@ -349,7 +414,7 @@ def _post(endpoint: str, body: dict, creds: dict | None = None) -> dict:
     headers = _get_headers(api_key, api_secret, payload)
     try:
         response = requests.post(url, headers=headers, data=payload, timeout=10, proxies=_resolve_proxies(creds))
-        return parse_response(response, f" [{endpoint.split('/')[-1]}]")
+        return parse_response(response, f" [{endpoint.split('/')[-1]}]", creds=creds, endpoint=endpoint.split('/')[-1])
     except requests.exceptions.Timeout:
         return {"retCode": -1, "retMsg": "Request timed out"}
     except Exception as e:
@@ -365,7 +430,7 @@ def _get_auth(endpoint: str, params: dict | None = None,
     headers = _get_headers(api_key, api_secret, "")
     try:
         response = requests.get(url, headers=headers, params=params, timeout=10, proxies=_resolve_proxies(creds))
-        return parse_response(response, f" [{endpoint.split('/')[-1]}]")
+        return parse_response(response, f" [{endpoint.split('/')[-1]}]", creds=creds, endpoint=endpoint.split('/')[-1])
     except Exception as e:
         logger.error(f"[Bybit] GET {endpoint} error: {e}")
         return {"error": str(e)}
@@ -811,6 +876,71 @@ def get_chat_messages(order_id: str, page: str = "1", size: str = "30",
 # ─────────────────────────────────────────
 # 🔄 Modify Ad
 # ─────────────────────────────────────────
+# ─────────────────────────────────────────
+# 🚦 Per-account modify pacing (fixes retCode 10006 "Too many visits")
+# ─────────────────────────────────────────
+# Bybit rate-limits the ACCOUNT, not each ad. With up to 8 ads per user —
+# several of them probing the ceiling (2 calls each: an out-of-range probe,
+# then the real post) on the same fast-chase tick — the calls used to leave
+# in a burst and trip 10006. Every modify for one API key now goes through
+# one lock with a minimum gap between calls, and a 10006 reply is retried
+# after a short back-off instead of being reported as a failure.
+# Tunable from Render (defaults are conservative):
+#   BYBIT_MODIFY_MIN_GAP_SECS  — spacing between modify calls per account (0.4s)
+#   BYBIT_MODIFY_10006_RETRIES — retries after a 10006 reply (3)
+import threading as _threading
+import time as _time
+
+_MODIFY_MIN_GAP  = float(os.getenv("BYBIT_MODIFY_MIN_GAP_SECS", "0.4") or 0.4)
+_MODIFY_10006_RETRIES = int(os.getenv("BYBIT_MODIFY_10006_RETRIES", "3") or 3)
+_modify_gates: dict = {}
+_modify_gates_guard = _threading.Lock()
+
+
+def _modify_gate(creds):
+    try:
+        key = _resolve_creds(creds)[0] or "default"
+    except Exception:
+        key = "default"
+    with _modify_gates_guard:
+        g = _modify_gates.get(key)
+        if g is None:
+            g = {"lock": _threading.Lock(), "last": 0.0}
+            _modify_gates[key] = g
+        return g
+
+
+def _paced_modify(ad_id: str, new_price, body: dict, creds) -> dict:
+    gate = _modify_gate(creds)
+    with gate["lock"]:
+        res = {}
+        for attempt in range(_MODIFY_10006_RETRIES + 1):
+            wait = max(_MODIFY_MIN_GAP - (_time.monotonic() - gate["last"]),
+                       gate.get("blocked_until", 0.0) - _time.monotonic())
+            if wait > 0:
+                _time.sleep(wait)
+            logger.info(f"[Bybit] MODIFY {ad_id} → price={new_price}")
+            res = _post("/v5/p2p/item/update", body, creds=creds)
+            gate["last"] = _time.monotonic()
+            rate = res.get("_rate") or {}
+            # Window used up (remaining 0)? Hold the NEXT call until Bybit's
+            # own reset time instead of firing into a guaranteed rejection.
+            if rate.get("remaining") == 0 and rate.get("reset_in"):
+                gate["blocked_until"] = _time.monotonic() + rate["reset_in"] + 0.05
+            code = str(res.get("retCode", res.get("ret_code", "")))
+            if code != "10006":
+                return res
+            if attempt < _MODIFY_10006_RETRIES:
+                back = 1.5 * (attempt + 1)
+                if rate.get("reset_in"):
+                    back = max(rate["reset_in"] + 0.1, 0.5)   # Bybit told us exactly when
+                logger.warning(f"[Bybit] 10006 rate limit on {ad_id} — backing off {back:.1f}s "
+                               f"(retry {attempt + 1}/{_MODIFY_10006_RETRIES})")
+                _time.sleep(back)
+        return res
+
+
+
 def modify_ad(ad_id: str, new_price: str, ad_data: dict,
               creds: dict | None = None) -> dict:
     payment_terms = ad_data.get("paymentTerms", [])
@@ -834,8 +964,7 @@ def modify_ad(ad_id: str, new_price: str, ad_data: dict,
         "remark": str(ad_data.get("remark", "")),
         "tradingPreferenceSet": trading_pref,
     }
-    logger.info(f"[Bybit] MODIFY {ad_id} → price={new_price}")
-    return _post("/v5/p2p/item/update", body, creds=creds)
+    return _paced_modify(ad_id, new_price, body, creds)
 
 
 # ─────────────────────────────────────────
