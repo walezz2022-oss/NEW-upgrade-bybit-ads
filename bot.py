@@ -102,7 +102,7 @@ from user_session import get_session, clear_session, get_all_sessions, SessionSt
 # Dedicated thread pool for ad modification calls (modify_ad via run_in_executor).
 # Isolated from the default executor so order/chat monitor threads can never starve
 # ad-update threads (and vice versa), which was causing Telegram timeouts under load.
-_ad_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ad_modify")
+_ad_executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="ad_modify")
 
 # Display-only — refreshed at the top of every button/command handler
 _current_user_id    = 0
@@ -4059,6 +4059,34 @@ async def _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, r
     should keep going to its normal inter-cycle sleep.
     """
     prefix = f"[{label}] " if _multi_ad(sess) else ""
+
+    if str(ret_code) == "10006":
+        # Bybit account-level rate limit ("Too many visits"). The modify call
+        # already backed off and retried inside bybit.py; if it STILL got
+        # 10006 this is temporary, not a broken ad — never count it toward the
+        # 2-in-a-row auto-stop, and don't spam the chat with it.
+        logger.warning(f"[{label}] Bybit 10006 rate limit — skipping this cycle, will retry next cycle")
+        if _should_notify_now(_ad_settings(sess, slot_idx), "bybit_10006", 600):
+            _hit = None
+            try:
+                _hit = bybit.get_rate_hit(get_user_creds(chat_id))
+            except Exception:
+                pass
+            if _hit and _hit.get("limit") is not None:
+                _ri = _hit.get("reset_in")
+                _detail = (
+                    f"\n📍 Endpoint: <code>{_esc(str(_hit.get('endpoint')))}</code>"
+                    f"\n📊 Limit: <code>{_hit['limit']}/sec</code> · Remaining: <code>{_hit['remaining']}</code>"
+                    + (f"\n⏱ Resets in: <code>{_ri:.1f}s</code>" if _ri is not None else "")
+                )
+            else:
+                _detail = "\n📍 Endpoint: <code>update</code> (Bybit did not return limit headers)"
+            await _safe_send(bot, chat_id=chat_id,
+                text=(f"⏳ {prefix}<b>Bybit rate limit hit (10006)</b>{_detail}\n\n"
+                      f"The limit is per account, per second, per endpoint. The bot is pacing "
+                      f"edits and retrying automatically — no action needed."),
+                parse_mode="HTML")
+        return False
 
     if ret_code == _BUDGET_COOLDOWN:
         # Not a real Bybit-side failure — just this one cycle's post being
