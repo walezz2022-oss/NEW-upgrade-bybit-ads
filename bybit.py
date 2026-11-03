@@ -891,7 +891,11 @@ def get_chat_messages(order_id: str, page: str = "1", size: str = "30",
 import threading as _threading
 import time as _time
 
-_MODIFY_MIN_GAP  = float(os.getenv("BYBIT_MODIFY_MIN_GAP_SECS", "0.4") or 0.4)
+# Bybit's headers show /v5/p2p/item/update is limited to 1 request PER SECOND
+# per UID (X-Bapi-Limit=1) — shared by ALL of a user's ads. Spacing is
+# measured request-START to request-START, and adapts to whatever limit the
+# headers report (gap = 1/limit + 0.1s).
+_MODIFY_MIN_GAP  = float(os.getenv("BYBIT_MODIFY_MIN_GAP_SECS", "1.1") or 1.1)
 _MODIFY_10006_RETRIES = int(os.getenv("BYBIT_MODIFY_10006_RETRIES", "3") or 3)
 _modify_gates: dict = {}
 _modify_gates_guard = _threading.Lock()
@@ -905,7 +909,7 @@ def _modify_gate(creds):
     with _modify_gates_guard:
         g = _modify_gates.get(key)
         if g is None:
-            g = {"lock": _threading.Lock(), "last": 0.0}
+            g = {"lock": _threading.Lock(), "last": 0.0, "gap": _MODIFY_MIN_GAP}
             _modify_gates[key] = g
         return g
 
@@ -915,14 +919,16 @@ def _paced_modify(ad_id: str, new_price, body: dict, creds) -> dict:
     with gate["lock"]:
         res = {}
         for attempt in range(_MODIFY_10006_RETRIES + 1):
-            wait = max(_MODIFY_MIN_GAP - (_time.monotonic() - gate["last"]),
+            wait = max(gate["gap"] - (_time.monotonic() - gate["last"]),
                        gate.get("blocked_until", 0.0) - _time.monotonic())
             if wait > 0:
                 _time.sleep(wait)
+            gate["last"] = _time.monotonic()          # START of this request
             logger.info(f"[Bybit] MODIFY {ad_id} → price={new_price}")
             res = _post("/v5/p2p/item/update", body, creds=creds)
-            gate["last"] = _time.monotonic()
             rate = res.get("_rate") or {}
+            if rate.get("limit"):
+                gate["gap"] = max(1.0 / rate["limit"] + 0.1, 0.2)   # learn the real limit from the headers
             # Window used up (remaining 0)? Hold the NEXT call until Bybit's
             # own reset time instead of firing into a guaranteed rejection.
             if rate.get("remaining") == 0 and rate.get("reset_in"):
@@ -933,7 +939,7 @@ def _paced_modify(ad_id: str, new_price, body: dict, creds) -> dict:
             if attempt < _MODIFY_10006_RETRIES:
                 back = 1.5 * (attempt + 1)
                 if rate.get("reset_in"):
-                    back = max(rate["reset_in"] + 0.1, 0.5)   # Bybit told us exactly when
+                    back = max(rate["reset_in"] + 0.1, gate["gap"])   # Bybit told us exactly when
                 logger.warning(f"[Bybit] 10006 rate limit on {ad_id} — backing off {back:.1f}s "
                                f"(retry {attempt + 1}/{_MODIFY_10006_RETRIES})")
                 _time.sleep(back)
